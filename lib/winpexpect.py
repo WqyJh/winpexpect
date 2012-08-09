@@ -11,16 +11,18 @@ import sys
 import pywintypes
 import itertools
 import random
+import time
+import signal
 
 from Queue import Queue, Empty
-from threading import Thread
+from threading import Thread, Lock
 
 from pexpect import spawn, ExceptionPexpect, EOF, TIMEOUT
 from subprocess import list2cmdline
 
 from msvcrt import open_osfhandle
 from win32api import (SetHandleInformation, GetCurrentProcess, OpenProcess,
-                      CloseHandle, GetCurrentThread)
+                      CloseHandle, GetCurrentThread, STD_INPUT_HANDLE)
 from win32pipe import CreateNamedPipe, ConnectNamedPipe
 from win32process import (STARTUPINFO, CreateProcess, CreateProcessAsUser,
 			  GetExitCodeProcess, TerminateProcess, ExitProcess)
@@ -30,14 +32,18 @@ from win32security import (LogonUser, OpenThreadToken, OpenProcessToken,
                            ConvertSidToStringSid, ConvertStringSidToSid,
                            SECURITY_ATTRIBUTES, SECURITY_DESCRIPTOR, ACL,
                            LookupAccountName)
-from win32file import CreateFile, ReadFile, WriteFile
+from win32file import CreateFile, ReadFile, WriteFile, INVALID_HANDLE_VALUE, FILE_SHARE_READ
+from win32console import (GetStdHandle, KEY_EVENT, ENABLE_WINDOW_INPUT, ENABLE_MOUSE_INPUT, 
+                          ENABLE_ECHO_INPUT, ENABLE_LINE_INPUT, ENABLE_PROCESSED_INPUT, 
+                          ENABLE_MOUSE_INPUT)
 
 from win32con import (HANDLE_FLAG_INHERIT, STARTF_USESTDHANDLES,
                       STARTF_USESHOWWINDOW, CREATE_NEW_CONSOLE, SW_HIDE,
                       PIPE_ACCESS_DUPLEX, WAIT_OBJECT_0, WAIT_TIMEOUT,
                       LOGON32_PROVIDER_DEFAULT, LOGON32_LOGON_INTERACTIVE,
                       TOKEN_ALL_ACCESS, GENERIC_READ, GENERIC_WRITE,
-                      OPEN_EXISTING, PROCESS_ALL_ACCESS, MAXIMUM_ALLOWED)
+                      OPEN_EXISTING, PROCESS_ALL_ACCESS, MAXIMUM_ALLOWED,
+                      LEFT_CTRL_PRESSED,RIGHT_CTRL_PRESSED)
 from winerror import (ERROR_PIPE_BUSY, ERROR_HANDLE_EOF, ERROR_BROKEN_PIPE,
                       ERROR_ACCESS_DENIED)
 from pywintypes import error as WindowsError
@@ -327,13 +333,15 @@ class winspawn(spawn):
 
     def __init__(self, command, args=[], timeout=30, maxread=2000,
                  searchwindowsize=None, logfile=None, cwd=None, env=None,
-                 username=None, domain=None, password=None):
+                 username=None, domain=None, password=None, stub=None):
         """Constructor."""
         self.username = username
         self.domain = domain
         self.password = password
+        self.stub = stub
         self.child_handle = None
         self.child_output = Queue()
+        self.user_input = Queue()
         self.chunk_buffer = ChunkBuffer()
         self.stdout_handle = None
         self.stdout_eof = False
@@ -341,6 +349,11 @@ class winspawn(spawn):
         self.stderr_handle = None
         self.stderr_eof = False
         self.stderr_reader = None
+        self.stdin_reader = None   # stdin of parent console
+        self.stdin_handle = None   # stdin of parent console
+        self.interrupted = False
+
+
         super(winspawn, self).__init__(command, args, timeout=timeout,
                 maxread=maxread, searchwindowsize=searchwindowsize,
                 logfile=logfile, cwd=cwd, env=env)
@@ -382,10 +395,14 @@ class winspawn(spawn):
         startupinfo.dwFlags |= STARTF_USESHOWWINDOW
         startupinfo.wShowWindow = SW_HIDE
 
-        python = os.path.join(sys.exec_prefix, 'python.exe')
-        pycmd = 'import winpexpect; winpexpect._stub(r"%s", r"%s", r"%s", r"%s")' \
+        if self.stub == None:
+            python = os.path.join(sys.exec_prefix, 'python.exe')
+            pycmd = 'import winpexpect; winpexpect._stub(r"%s", r"%s", r"%s", r"%s")' \
                     % (cmd_name, stdin_name, stdout_name, stderr_name)
-        pyargs = join_command_line([python, '-c', pycmd])
+            pyargs = join_command_line([python, '-c', pycmd])
+        else:
+            python = self.stub
+            pyargs = join_command_line([python, cmd_name, stdin_name, stdout_name, stderr_name])
 
         # Create a new token or run as the current process.
         if self.username and self.password:
@@ -438,20 +455,13 @@ class winspawn(spawn):
         self.terminated = False
         self.closed = False
 
-    def terminate(self):
+    def terminate(self, force=False):
         """Terminate the child process. This also closes all the file
         descriptors."""
         if self.child_handle is None or self.terminated:
             return
-        try:
-            TerminateProcess(self.child_handle, 1)
-        except WindowsError, e:
-            # ERROR_ACCESS_DENIED (also) happens when the child has already
-            # exited.
-            if e.winerror == ERROR_ACCESS_DENIED and not self.isalive():
-                pass
-            else:
-                raise
+
+        self.__terminate(force)
         self.close()
         self.wait()
         self.terminated = True
@@ -460,16 +470,20 @@ class winspawn(spawn):
         """Close all communications channels with the child."""
         if self.closed:
             return
+
+        self.interrupted = True
+        if self.stdin_reader:
+            CloseHandle(self.stdin_handle)
+            self.stdin_reader.join()
+
         os.close(self.child_fd)
         CloseHandle(self.stdout_handle)
         CloseHandle(self.stderr_handle)
-        # File descriptors are closed, nothing can be added to the queue
-        # anymore. Empty it in case a thread was blocked on put().
-        while self.child_output.qsize():
-            self.child_output.get()
+
         # Now the threads are ready to be joined.
         self.stdout_reader.join()
         self.stderr_reader.join()
+
         self.closed = True
 
     def wait(self, timeout=None):
@@ -499,14 +513,169 @@ class winspawn(spawn):
         return True
 
     def kill(self, signo):
-        """Send a signal to the child (not available on Windows)."""
-        raise ExceptionPexpect, 'Signals are not availalbe on Windows'
+        """The signal.CTRL_C_EVENT and signal.CTRL_BREAK_EVENT signals is 
+        avaiable under windows from Python3.2. Any other value for sig will 
+        cause the process to be unconditionally killed by the TerminateProcess 
+        API,"""
+
+        if sys.version_info[0] == 3 and sys.version_info[1] >= 2:
+            super().kill(signo)
+        else:
+            raise ExceptionPexpect, 'Signals are not availalbe on Windows'
+
+    def __terminate(self, force=False):
+        """This forces a child process to terminate. It starts nicely with
+        signal.CTRL_C_EVENT and signal.CTRL_BREAK_EVENT. If "force" is True 
+        then moves onto TerminateProcess. This returns True if the child 
+        was terminated. This returns False if the child could not be terminated. 
+        For python earlier than 3.2, force parameter will be ignored and 
+        TerminateProcess will be always used"""
+
+        if not self.isalive():
+            return True
+
+        if sys.version_info[0] == 3 and sys.version_info[1] >= 2:
+            try:
+                self.kill(signal.CTRL_C_EVENT)
+                time.sleep(self.delayafterterminate)
+                if not self.isalive():
+                    return True
+
+                self.kill(signal.CTRL_BREAK_EVENT)
+                time.sleep(self.delayafterterminate)
+                if not self.isalive():
+                    return True
+
+                if force:
+                    # any value other than CTRL_C_EVENT and signal.CTRL_BREAK_EVENT 
+                    # will terminate the process by killed by the TerminateProcess 
+                    self.kill(123)   
+                    time.sleep(self.delayafterterminate)
+                    return (not self.isalive())
+
+                return False
+            except OSError as e:
+                # I think there are kernel timing issues that sometimes cause
+                # this to happen. I think isalive() reports True, but the
+                # process is dead to the kernel.
+                # Make one last attempt to see if the kernel is up to date.
+                time.sleep(self.delayafterterminate)
+                return (not self.isalive())
+        else:
+            try:
+                TerminateProcess(self.child_handle, 1)
+                time.sleep(self.delayafterterminate)
+                return (not self.isalive())                  
+            except WindowsError, e:
+                # ERROR_ACCESS_DENIED (also) happens when the child has already
+                # exited.
+                return  (e.winerror == ERROR_ACCESS_DENIED and not self.isalive())             
+
+
+    def interact(self, escape_character = chr(29), input_filter = None, output_filter = None):
+        # Flush the buffer.
+        self.stdin_reader = Thread(target=self._stdin_reader)
+        self.stdin_reader.start()
+        self.interrupted = False
+
+        try:
+            while self.isalive():
+                data = self.__interact_read(self.stdin_handle)
+                if data != None:
+                    if input_filter: data = input_filter(data)
+                    i = data.rfind(escape_character)
+                    if i != -1:
+                        data = data[:i]
+                        os.write(self.child_fd, data.encode('ascii'))
+                        break
+                    os.write(self.child_fd, data.encode('ascii'))
+
+                data = self.__interact_read(self.child_fd)
+                if data != None:
+                    if output_filter: data = output_filter(data)
+                    self.__output_log(data)
+                    if sys.stdout not in (self.logfile, self.logfile_read):
+                        sys.stdout.write(data)
+
+            # child exited, read all the remainder output
+            while self.child_output.qsize():
+                handle, status, data = self.child_output.get(block=False)
+                if status != 'data':
+                    break
+                self.__output_log(data)
+                if sys.stdout not in (self.logfile, self.logfile_read):
+                    sys.stdout.write(data)
+        except KeyboardInterrupt:
+            self.interrupted = True
+            self.terminate()
+            return
+
+        self.close()
+
+    def __output_log(self, data):
+        if self.logfile is not None:
+            self.logfile.write (data)
+            self.logfile.flush()
+
+        if self.logfile_read is not None:
+            self.logfile_read.write(data)
+            self.logfile_read.flush()
+
+    def __interact_read(self, fd):
+
+        """This is used by the interact() method.
+        """
+        data = ''
+        try:
+            if fd == self.stdin_handle:
+                data = self.user_input.get(block=False) 
+            else:
+                handle, status, data = self.child_output.get(timeout=0.1)
+                if status == 'eof':
+                    self._set_eof(handle)
+                    raise EOF, 'End of file in read_nonblocking().'
+                elif status == 'error':
+                    self._set_eof(handle)
+                    raise OSError, data
+        except Exception as e:
+            data = None
+
+        return data
+
+
+    def _stdin_reader(self):
+        """INTERNAL: Reader thread that reads stdin for user interaction"""
+        self.stdin_handle = GetStdHandle(STD_INPUT_HANDLE)
+        self.stdin_handle.SetConsoleMode(ENABLE_LINE_INPUT|ENABLE_ECHO_INPUT|ENABLE_MOUSE_INPUT|
+                             ENABLE_WINDOW_INPUT|ENABLE_MOUSE_INPUT|ENABLE_PROCESSED_INPUT)
+
+        # Remove flag: ENABLE_PROCESSED_INPUT to deal with the ctrl-c myself
+        try:
+            while not self.interrupted:
+                ret = WaitForSingleObject(self.stdin_handle, 1000)
+
+                if ret == WAIT_OBJECT_0:
+                    records = self.stdin_handle.PeekConsoleInput(1)
+                    rec = records[0]
+                    if rec.EventType == KEY_EVENT:
+                        if not rec.KeyDown or ord(rec.Char) == 0:
+                            self.stdin_handle.FlushConsoleInputBuffer()
+                            continue
+                    else:
+                        continue
+
+                    err, data = ReadFile(self.stdin_handle, self.maxread)
+                    #print('read finished:', [hex(ord(i)) for i in data], err)
+
+                    self.user_input.put(data)                      
+        except Exception as e:
+            pass
 
     def _child_reader(self, handle):
         """INTERNAL: Reader thread that reads stdout/stderr of the child
         process."""
         status = 'data'
-        while True:
+        while not self.interrupted:
             try:
                 err, data = ReadFile(handle, self.maxread)
                 assert err == 0  # not expecting error w/o overlapped io
@@ -550,10 +719,5 @@ class winspawn(spawn):
             self._set_eof(handle)
             raise OSError, data
         buf = self.chunk_buffer.read(size)
-        if self.logfile is not None:
-            self.logfile.write(buf)
-            self.logfile.flush()
-        if self.logfile_read is not None:
-            self.logfile_read.write(buf)
-            self.logfile_read.flush()
+        self.__output_log(buf)
         return buf
