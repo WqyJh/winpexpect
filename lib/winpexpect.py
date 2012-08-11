@@ -520,7 +520,8 @@ class winspawn(spawn):
         startupinfo.wShowWindow = SW_HIDE
 
         if self.stub == None:
-            python = os.path.join(sys.exec_prefix, 'python.exe')
+            #ython = os.path.join(sys.exec_prefix, 'python.exe')
+            python = sys.executable
             pycmd = 'import winpexpect; winpexpect._stub(r"%s", r"%s", r"%s", r"%s")' \
                     % (cmd_name, stdin_name, stdout_name, stderr_name)
             pyargs = join_command_line([python, '-c', pycmd])
