@@ -22,10 +22,12 @@ from subprocess import list2cmdline
 
 from msvcrt import open_osfhandle
 from win32api import (SetHandleInformation, GetCurrentProcess, OpenProcess,
+                      PostMessage, SendMessage,
                       CloseHandle, GetCurrentThread, STD_INPUT_HANDLE)
 from win32pipe import CreateNamedPipe, ConnectNamedPipe
 from win32process import (STARTUPINFO, CreateProcess, CreateProcessAsUser,
-			  GetExitCodeProcess, TerminateProcess, ExitProcess)
+			  GetExitCodeProcess, TerminateProcess, ExitProcess,
+                          GetWindowThreadProcessId)
 from win32event import WaitForSingleObject, INFINITE
 from win32security import (LogonUser, OpenThreadToken, OpenProcessToken,
                            GetTokenInformation, TokenUser, ACL_REVISION_DS,
@@ -43,7 +45,9 @@ from win32con import (HANDLE_FLAG_INHERIT, STARTF_USESTDHANDLES,
                       LOGON32_PROVIDER_DEFAULT, LOGON32_LOGON_INTERACTIVE,
                       TOKEN_ALL_ACCESS, GENERIC_READ, GENERIC_WRITE,
                       OPEN_EXISTING, PROCESS_ALL_ACCESS, MAXIMUM_ALLOWED,
-                      LEFT_CTRL_PRESSED,RIGHT_CTRL_PRESSED)
+                      LEFT_CTRL_PRESSED,RIGHT_CTRL_PRESSED,
+                      WM_CHAR, VK_RETURN, WM_KEYDOWN, WM_KEYUP)
+from win32gui import EnumWindows
 from winerror import (ERROR_PIPE_BUSY, ERROR_HANDLE_EOF, ERROR_BROKEN_PIPE,
                       ERROR_ACCESS_DENIED)
 from pywintypes import error as WindowsError
@@ -451,6 +455,14 @@ class winspawn(spawn):
     # way it cannot interfere with the current console, and it is also
     # possible to run the main program without a console (e.g. a Windows
     # service).
+    # 
+    # NOTE:
+    # Some special application will identify the input type. If its input handle 
+    # is not the stdin, the child process will disable the interactive mode. 
+    # For example: To run python as interactive mode, we should do like below:
+    #     child = winspawn('python', ['-i'])
+    # option '-i' will force the python into interactive mode
+    #
 
     pipe_buffer = 4096
     pipe_template = r'\\.\pipe\winpexpect-%06d'
@@ -463,6 +475,7 @@ class winspawn(spawn):
         self.domain = domain
         self.password = password
         self.stub = stub
+        self.child_hwnd = None
         self.child_handle = None
         self.child_output = Queue()
         self.user_input = Queue()
@@ -519,8 +532,8 @@ class winspawn(spawn):
         startupinfo.dwFlags |= STARTF_USESHOWWINDOW
         startupinfo.wShowWindow = SW_HIDE
 
-        if self.stub == None:
-            #ython = os.path.join(sys.exec_prefix, 'python.exe')
+        if self.stub == None or not getattr(sys, 'frozen', False):
+            # python = os.path.join(sys.exec_prefix, 'python.exe')
             python = sys.executable
             pycmd = 'import winpexpect; winpexpect._stub(r"%s", r"%s", r"%s", r"%s")' \
                     % (cmd_name, stdin_name, stdout_name, stderr_name)
@@ -577,6 +590,24 @@ class winspawn(spawn):
         self.stderr_reader = Thread(target=self._child_reader,
                                     args=(self.stderr_handle,))
         self.stderr_reader.start()
+
+        # find the handle of the child console window
+        find_hwnds = []
+        def cb_comparewnd (hwnd, lparam):
+            _, pid = GetWindowThreadProcessId(hwnd)
+            if pid == self.pid:
+                find_hwnds.append(hwnd)
+            return True
+        
+        tmfind = time.time()
+        while True:
+            EnumWindows(cb_comparewnd, None)
+            if find_hwnds:
+                self.child_hwnd = find_hwnds[0]
+                break
+            if time.time() - tmfind > self.timeout:
+                raise ExceptionPexpect, 'Did not find child console window'
+
         self.terminated = False
         self.closed = False
 
@@ -694,8 +725,84 @@ class winspawn(spawn):
             except WindowsError, e:
                 # ERROR_ACCESS_DENIED (also) happens when the child has already
                 # exited.
-                return  (e.winerror == ERROR_ACCESS_DENIED and not self.isalive())             
+                return  (e.winerror == ERROR_ACCESS_DENIED and not self.isalive())
 
+
+    def direct_send(self, s):
+
+        """Some subprocess is using the getche() to get the input, the most 
+        common case is the password input. The getche() doesn't listen at 
+        the stdin. So the send() doesn't work on this case. Here we will send 
+        the string to the console window by windows message: WM_KEYDOWN, 
+        WM_KEYUP, WM_CHAR. 
+
+        There is another way available to implement the direct-send function.
+        That is attach the child console from the stub process and write the 
+        console input directly. Here is the implement steps:
+        1. In the stub process add below code and don't exit the stub process. 
+            def _string2records(s):
+                records = []
+                for c in s:
+                    rec = win32console.PyINPUT_RECORDType(KEY_EVENT)
+                    rec.KeyDown = True
+                    rec.RepeatCount = 1
+                    rec.Char = c
+                    rec.VirtualKeyCode = ord(c)
+                    records.append(rec)
+
+                    rec = win32console.PyINPUT_RECORDType(KEY_EVENT)
+                    rec.KeyDown = False
+                    rec.RepeatCount = 1
+                    rec.Char = c
+                    rec.VirtualKeyCode = ord(c)        
+                    records.append(rec)        
+                return records
+            while True:
+                header = _read_header(cmd_pipe)
+                input = _parse_header(header)
+
+                if input['command'] == 'send':
+                    try:
+                        win32console.AttachConsole(pid)
+                        s = input['string']
+                        stdin_handle = GetStdHandle(STD_INPUT_HANDLE)
+                        records = _string2records(s)
+                        nrecords = stdin_handle.WriteConsoleInput(records)
+                        win32console.FreeConsole()
+                    except WindowsError as e:
+                        message = _quote_header(str(e))
+                        WriteFile(cmd_pipe, 
+                            'status=error\nmessage=%s\n\n' % message)
+                    else:
+                        WriteFile(cmd_pipe, 
+                            'status=ok\nnbytes=%d\n\n' % nrecords)
+        2. The stub executable must be win32gui type, using "pythonw.exe" 
+        instead of "python.exe"
+        3. direct_send function can be implemented as below:
+            WriteFile(self.stub_pipe, 'command=send\nstring=%s\n\n' % s)
+            header = _read_header(self.stub_pipe)
+            output = _parse_header(header)
+            if output['status'] != 'ok':
+                m = 'send string failed: '
+                m += output.get('message', '')
+                raise ExceptionPexpect(m)
+        4. This way can not send the CRLF(don't know the reason). For send 
+        the CRLF, we still need the SendMessage like the direct_sendline do.
+
+        Finally, I choose to use the windows message solution, just because
+        it looks like much simple than the attach-console solution.
+        """
+        self.__input_log(s)
+        for c in s:
+            PostMessage(self.child_hwnd, WM_CHAR, ord(c), 1)
+
+
+    def direct_sendline(self, s):
+        self.direct_send(s)
+
+        self.__input_log('\r\n')
+        PostMessage(self.child_hwnd, WM_KEYDOWN, VK_RETURN, 0x001C0001)
+        PostMessage(self.child_hwnd, WM_KEYUP, VK_RETURN, 0xC01C0001)
 
     def interact(self, escape_character = chr(29), input_filter = None, output_filter = None):
         # Flush the buffer.
@@ -720,6 +827,7 @@ class winspawn(spawn):
                     if output_filter: data = output_filter(data)
                     self.__output_log(data)
                     if sys.stdout not in (self.logfile, self.logfile_read):
+                        # interactive mode, the child output will be always output to stdout 
                         sys.stdout.write(data)
 
             # child exited, read all the remainder output
@@ -746,11 +854,20 @@ class winspawn(spawn):
             self.logfile_read.write(data)
             self.logfile_read.flush()
 
+    def __input_log(self, data):
+        if self.logfile is not None:
+            self.logfile.write (data)
+            self.logfile.flush()
+
+        if self.logfile_send is not None:
+            self.logfile_send.write (data)
+            self.logfile_send.flush()        
+
     def __interact_read(self, fd):
 
         """This is used by the interact() method.
         """
-        data = ''
+        data = None
         try:
             if fd == self.stdin_handle:
                 data = self.user_input.get(block=False) 
@@ -758,7 +875,7 @@ class winspawn(spawn):
                 handle, status, data = self.child_output.get(timeout=0.1)
                 if status == 'eof':
                     self._set_eof(handle)
-                    raise EOF, 'End of file in read_nonblocking().'
+                    raise EOF, 'End of file in interact_read().'
                 elif status == 'error':
                     self._set_eof(handle)
                     raise OSError, data
@@ -787,6 +904,8 @@ class winspawn(spawn):
                             self.stdin_handle.FlushConsoleInputBuffer()
                             continue
                     else:
+                        # discard the events: FOCUS_EVENT/WINDOW_BUFFER_SIZE_EVENT/MENU_EVENT,
+                        self.stdin_handle.FlushConsoleInputBuffer()
                         continue
 
                     err, data = ReadFile(self.stdin_handle, self.maxread)
@@ -811,6 +930,7 @@ class winspawn(spawn):
                 else:
                     status = 'error'
                     data = e.winerror
+
             self.child_output.put((handle, status, data))
             if status != 'data':
                 break
