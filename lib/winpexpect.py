@@ -792,7 +792,7 @@ class winspawn(spawn):
         Finally, I choose to use the windows message solution, just because
         it looks like much simple than the attach-console solution.
         """
-        self.__input_log(s)
+        self._input_log(s)
         for c in s:
             PostMessage(self.child_hwnd, WM_CHAR, ord(c), 1)
 
@@ -800,7 +800,7 @@ class winspawn(spawn):
     def direct_sendline(self, s):
         self.direct_send(s)
 
-        self.__input_log('\r\n')
+        self._input_log('\r\n')
         PostMessage(self.child_hwnd, WM_KEYDOWN, VK_RETURN, 0x001C0001)
         PostMessage(self.child_hwnd, WM_KEYUP, VK_RETURN, 0xC01C0001)
 
@@ -812,7 +812,7 @@ class winspawn(spawn):
 
         try:
             while self.isalive():
-                data = self.__interact_read(self.stdin_handle)
+                data = self._interact_read(self.stdin_handle)
                 if data != None:
                     if input_filter: data = input_filter(data)
                     i = data.rfind(escape_character)
@@ -822,10 +822,10 @@ class winspawn(spawn):
                         break
                     os.write(self.child_fd, data.encode('ascii'))
 
-                data = self.__interact_read(self.child_fd)
+                data = self._interact_read(self.child_fd)
                 if data != None:
                     if output_filter: data = output_filter(data)
-                    self.__output_log(data)
+                    self._output_log(data)
                     if sys.stdout not in (self.logfile, self.logfile_read):
                         # interactive mode, the child output will be always output to stdout 
                         sys.stdout.write(data)
@@ -835,7 +835,7 @@ class winspawn(spawn):
                 handle, status, data = self.child_output.get(block=False)
                 if status != 'data':
                     break
-                self.__output_log(data)
+                self._output_log(data)
                 if sys.stdout not in (self.logfile, self.logfile_read):
                     sys.stdout.write(data)
         except KeyboardInterrupt:
@@ -845,7 +845,7 @@ class winspawn(spawn):
 
         self.close()
 
-    def __output_log(self, data):
+    def _output_log(self, data):
         if self.logfile is not None:
             self.logfile.write (data)
             self.logfile.flush()
@@ -854,7 +854,7 @@ class winspawn(spawn):
             self.logfile_read.write(data)
             self.logfile_read.flush()
 
-    def __input_log(self, data):
+    def _input_log(self, data):
         if self.logfile is not None:
             self.logfile.write (data)
             self.logfile.flush()
@@ -863,7 +863,7 @@ class winspawn(spawn):
             self.logfile_send.write (data)
             self.logfile_send.flush()        
 
-    def __interact_read(self, fd):
+    def _interact_read(self, fd):
 
         """This is used by the interact() method.
         """
@@ -964,5 +964,5 @@ class winspawn(spawn):
             self._set_eof(handle)
             raise OSError, data
         buf = self.chunk_buffer.read(size)
-        self.__output_log(buf)
+        self._output_log(buf)
         return buf
